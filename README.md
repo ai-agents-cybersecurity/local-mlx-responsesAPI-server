@@ -1,6 +1,8 @@
 # MLX Local Inference Server
 
-An OpenAI-compatible local inference server for Apple Silicon using [MLX](https://github.com/ml-explore/mlx). Drop-in replacement for any app that speaks the OpenAI protocol.
+![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20(M1/M2/M3/M4)-green) ![API](https://img.shields.io/badge/API-Chat%20Completions-blue) ![API](https://img.shields.io/badge/API-Responses-green) ![Privacy](https://img.shields.io/badge/Privacy-Local%20Inference-orange)
+
+An OpenAI-compatible local inference server for Apple Silicon using [MLX](https://github.com/ml-explore/mlx). Drop-in replacement for any app that speaks the OpenAI protocol, serving Chat Completions and Responses APIs.
 
 ## What's in here
 
@@ -12,6 +14,10 @@ An OpenAI-compatible local inference server for Apple Silicon using [MLX](https:
 ## server.py — the main event
 
 A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoints. Any app or library that works with the OpenAI API works with this server out of the box.
+
+
+
+<img src="screen.png" width="50%">
 
 ### Features
 
@@ -55,6 +61,10 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 | `stream` | false | SSE streaming |
 
 Extra fields sent by OpenAI clients (like `presence_penalty`, `frequency_penalty`, etc.) are silently ignored so nothing breaks.
+
+## 
+
+🚀 [Roadmap](ROADMAP.md)
 
 ## Requirements
 
