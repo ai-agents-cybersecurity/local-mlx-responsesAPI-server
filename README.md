@@ -1,6 +1,6 @@
 # MLX Local Inference Server
 
-![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20(M1/M2/M3/M4)-green) ![API](https://img.shields.io/badge/API-Chat%20Completions-blue) ![API](https://img.shields.io/badge/API-Responses-green) ![Privacy](https://img.shields.io/badge/Privacy-Local%20Inference-orange)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20(M1/M2/M3/M4)-green) ![API](https://img.shields.io/badge/API-Chat%20Completions-blue) ![API](https://img.shields.io/badge/API-Responses-green) ![Privacy](https://img.shields.io/badge/Privacy-Local%20Inference-orange) ![Built with](https://img.shields.io/badge/Built%20with-Claude-7B3F00?logo=anthropic)
 
 An OpenAI-compatible local inference server for Apple Silicon using [MLX](https://github.com/ml-explore/mlx). Drop-in replacement for any app that speaks the OpenAI protocol, serving Chat Completions and Responses APIs.
 
