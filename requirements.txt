@@ -1,0 +1,8 @@
+# ── MLX Inference ──
+mlx>=0.22.0                      # Apple MLX framework
+mlx-lm>=0.21.0                   # Local LLM inference (Llama, Mistral, etc.)
+
+# ── Server (server.py) ──
+fastapi>=0.115.0                 # Web framework
+uvicorn[standard]>=0.30.0        # ASGI server
+pydantic>=2.0                    # Request/response validation

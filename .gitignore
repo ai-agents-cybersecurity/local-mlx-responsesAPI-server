@@ -1,0 +1,53 @@
+# Claude Code
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# MLX / model weights
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+models/
+
+# Logs & output
+conversation_logs/
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
