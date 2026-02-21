@@ -63,7 +63,16 @@ log = logging.getLogger("mlx-server")
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list | None = None
+    model_config = {"extra": "ignore"}
+
+    def text(self) -> str:
+        """Normalise content to a plain string."""
+        if self.content is None:
+            return ""
+        if isinstance(self.content, list):
+            return _normalise_content(self.content)
+        return self.content
 
 
 class ChatCompletionRequest(BaseModel):
@@ -231,6 +240,8 @@ def _evict_conversations() -> None:
 def _store_conversation(resp_id: str, session_id: str, messages: list[dict]) -> None:
     """Store a conversation and evict stale entries."""
     _conversation_store[resp_id] = (time.time(), session_id, messages)
+    log.info("Stored conversation %s (session %s, %d messages, store size=%d)",
+             resp_id, session_id, len(messages), len(_conversation_store))
     _evict_conversations()
 
 
@@ -239,12 +250,16 @@ def _get_conversation(resp_id: str) -> tuple[str, list[dict]] | None:
     Returns (session_id, messages) or None."""
     entry = _conversation_store.get(resp_id)
     if entry is None:
+        log.warning("Conversation lookup MISS for %s (store has %d entries: %s)",
+                    resp_id, len(_conversation_store), list(_conversation_store.keys()))
         return None
     ts, session_id, messages = entry
     if time.time() - ts > _CONVERSATION_TTL:
+        log.warning("Conversation %s expired (age=%.0fs)", resp_id, time.time() - ts)
         _conversation_store.pop(resp_id)
         _archive_conversation(resp_id, ts, session_id, messages)
         return None
+    log.info("Conversation lookup HIT for %s (session %s, %d messages)", resp_id, session_id, len(messages))
     return session_id, messages
 
 
@@ -296,6 +311,26 @@ def _msg_id() -> str:
     return "msg_" + uuid.uuid4().hex[:12]
 
 
+def _normalise_content(content) -> str:
+    """Normalise content to a plain string (handles str, list-of-parts, None)."""
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                ptype = part.get("type", "")
+                # Handle both "text" and "input_text" content part types
+                if ptype in ("text", "input_text"):
+                    parts.append(part.get("text", ""))
+                elif "text" in part:
+                    parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        return "".join(parts)
+    return str(content)
+
+
 def _responses_input_to_messages(
     input_data: str | list,
     instructions: str | None,
@@ -304,7 +339,8 @@ def _responses_input_to_messages(
     """Convert Responses API input (string or message list) to internal format.
 
     When *previous_response_id* is given, the prior conversation is prepended
-    so the model sees the full multi-turn context.
+    so the model sees the full multi-turn context.  When not given but input
+    contains multiple roles (user + assistant), treat it as inline history.
 
     Returns (session_id, messages).
     """
@@ -313,11 +349,18 @@ def _responses_input_to_messages(
     if isinstance(input_data, str):
         new_messages.append({"role": "user", "content": input_data})
     else:
+        log.info("Responses input list (%d items): %r", len(input_data), input_data)
         for item in input_data:
             if isinstance(item, dict):
-                new_messages.append(
-                    {"role": item.get("role", "user"), "content": item.get("content", "")}
-                )
+                role = item.get("role", "user")
+                content = _normalise_content(item.get("content", ""))
+                # Some clients send {"type": "message", ...} wrapper
+                if item.get("type") == "message" and not content and "content" not in item:
+                    # Skip structural items without content
+                    continue
+                new_messages.append({"role": role, "content": content})
+            elif isinstance(item, str):
+                new_messages.append({"role": "user", "content": item})
 
     # -- resolve prior context --
     prior_result = _get_conversation(previous_response_id) if previous_response_id else None
@@ -389,7 +432,7 @@ async def chat_completions(req: ChatCompletionRequest):
     if not holder.loaded:
         raise HTTPException(503, "Model not loaded yet")
 
-    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    messages = [{"role": m.role, "content": m.text()} for m in req.messages]
     prompt_text, prompt_len = _build_prompt(holder.tokenizer, messages)
 
     max_tokens = req.max_tokens or 4096
@@ -508,6 +551,8 @@ async def chat_completions(req: ChatCompletionRequest):
 
 @app.post("/v1/responses")
 async def responses_create(req: ResponsesRequest):
+    log.info("Responses request: model=%s, prev_id=%s, stream=%s, input_type=%s",
+             req.model, req.previous_response_id, req.stream, type(req.input).__name__)
     if not holder.loaded:
         raise HTTPException(503, "Model not loaded yet")
 

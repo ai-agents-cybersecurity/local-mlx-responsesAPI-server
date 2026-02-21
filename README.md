@@ -39,7 +39,7 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 | Parameter | Default | Notes |
 |---|---|---|
 | `model` | loaded model | Ignored for routing; echoed back in the response |
-| `messages` | required | Standard role/content message list |
+| `messages` | required | Standard role/content message list (string, list-of-parts, or null content supported) |
 | `temperature` | 0.7 | 0.0–2.0 |
 | `top_p` | 0.95 | 0.0–1.0 |
 | `max_tokens` | 4096 | |
@@ -52,7 +52,7 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 | Parameter | Default | Notes |
 |---|---|---|
 | `model` | loaded model | Ignored for routing; echoed back in the response |
-| `input` | required | String or message list |
+| `input` | required | String or message list (supports inline conversation history and multi-part content) |
 | `instructions` | none | System prompt |
 | `previous_response_id` | none | Chain multi-turn conversations |
 | `temperature` | 0.7 | 0.0–2.0 |
@@ -61,6 +61,16 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 | `stream` | false | SSE streaming |
 
 Extra fields sent by OpenAI clients (like `presence_penalty`, `frequency_penalty`, etc.) are silently ignored so nothing breaks.
+
+### Client compatibility
+
+Tested with:
+- **OpenAI Python SDK** — Chat Completions and Responses APIs
+- **OpenClaw** — via `"api": "openai-responses"` custom provider config
+- **curl** — direct HTTP requests
+- **Browser-based apps** — via CORS
+
+The server accepts `content` as a plain string, a list of content parts (`"text"` or `"input_text"` types), or `null` — covering all formats used by OpenAI-compatible clients.
 
 ## 
 
