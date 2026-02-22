@@ -481,7 +481,12 @@ def _parse_json_tool_call(inner: str) -> dict | None:
     except json.JSONDecodeError:
         return None
 
-    name = parsed.get("name", "")
+    # Must have a "name" key to be a valid tool call — reject random JSON
+    # fragments that the greedy regex might pick up from XML parameter values
+    if "name" not in parsed:
+        return None
+
+    name = parsed["name"]
     arguments = parsed.get("arguments", {})
     if isinstance(arguments, dict):
         arguments = json.dumps(arguments)
