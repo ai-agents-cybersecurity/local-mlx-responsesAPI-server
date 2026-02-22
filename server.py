@@ -475,8 +475,12 @@ _TOOL_CALL_FUNC_RE = re.compile(r"<function=([^>]+)>([\s\S]*?)</function>", re.D
 _TOOL_CALL_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>", re.DOTALL)
 
 # MiniMax invoke format: <invoke name="NAME"><parameter name="KEY">VALUE</parameter></invoke>
-_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)">([\s\S]*?)</invoke>', re.DOTALL)
-_INVOKE_PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)">\s*([\s\S]*?)\s*</parameter>', re.DOTALL)
+# Flexible quoting: name="X", name='X', name=X all accepted
+_INVOKE_RE = re.compile(r'<invoke\s+name\s*=\s*["\']?([^"\'>\s]+)["\']?\s*>([\s\S]*?)</invoke>', re.DOTALL)
+_INVOKE_PARAM_RE = re.compile(r'<parameter\s+name\s*=\s*["\']?([^"\'>\s]+)["\']?\s*>\s*([\s\S]*?)\s*</parameter>', re.DOTALL)
+
+# Bare <invoke> blocks not wrapped in any tool_call container
+_BARE_INVOKE_RE = re.compile(r'<invoke\s+name\s*=\s*["\']?([^"\'>\s]+)["\']?\s*>([\s\S]*?)</invoke>', re.DOTALL)
 
 
 def _parse_xml_tool_call(inner: str) -> dict | None:
@@ -501,21 +505,14 @@ def _parse_xml_tool_call(inner: str) -> dict | None:
     return {"name": name, "arguments": json.dumps(params)}
 
 
-def _parse_invoke_tool_call(inner: str) -> dict | None:
-    """Parse MiniMax invoke format: <invoke name="NAME"><parameter name="K">V</parameter></invoke>.
+def _parse_invoke_body(name: str, body: str) -> dict | None:
+    """Parse parameters from the body of an <invoke> block.
 
-    Also handles mixed formats where parameters use <parameter=K> (Qwen-style)
-    or where arguments are JSON inside the <invoke> body.
+    Tries multiple parameter formats and JSON fallback.
+    Returns {"name": ..., "arguments": "..."} or None.
     """
-    invoke_match = _INVOKE_RE.search(inner)
-    if not invoke_match:
-        return None
-
-    name = invoke_match.group(1).strip()
-    body = invoke_match.group(2)
-
     params = {}
-    # Try <parameter name="key">value</parameter> first
+    # Try <parameter name="key">value</parameter> (with flexible quoting)
     for pm in _INVOKE_PARAM_RE.finditer(body):
         key = pm.group(1).strip()
         value = pm.group(2).strip()
@@ -549,6 +546,17 @@ def _parse_invoke_tool_call(inner: str) -> dict | None:
         log.warning("Invoke tool call '%s' has no parseable arguments. Body: %s", name, body[:300])
 
     return {"name": name, "arguments": json.dumps(params)}
+
+
+def _parse_invoke_tool_call(inner: str) -> dict | None:
+    """Parse MiniMax invoke format: <invoke name="NAME"><parameter name="K">V</parameter></invoke>."""
+    invoke_match = _INVOKE_RE.search(inner)
+    if not invoke_match:
+        return None
+
+    name = invoke_match.group(1).strip()
+    body = invoke_match.group(2)
+    return _parse_invoke_body(name, body)
 
 
 def _parse_json_tool_call(inner: str) -> dict | None:
@@ -588,13 +596,32 @@ def _parse_tool_calls(raw_text: str) -> tuple[str | None, list[dict]]:
     Returns (remaining_text_or_None, list_of_tool_call_dicts).
     Each tool call dict has {id, type, function: {name, arguments}}.
     """
-    # Try standard <tool_call> blocks first, then MiniMax format
+    # Try standard <tool_call> blocks first, then MiniMax wrapper, then bare <invoke>
     blocks = _TOOL_CALL_BLOCK_RE.findall(raw_text)
     strip_re = _TOOL_CALL_BLOCK_RE
     if not blocks:
         blocks = _MINIMAX_BLOCK_RE.findall(raw_text)
         strip_re = _MINIMAX_BLOCK_RE
     if not blocks:
+        # Last resort: look for bare <invoke> blocks directly in the text
+        invoke_matches = _BARE_INVOKE_RE.finditer(raw_text)
+        bare_calls = []
+        for m in invoke_matches:
+            name = m.group(1).strip()
+            body = m.group(2)
+            result = _parse_invoke_body(name, body)
+            if result:
+                log.info("Bare invoke tool call: %s", result)
+                bare_calls.append({
+                    "id": _call_id(),
+                    "type": "function",
+                    "function": result,
+                })
+        if bare_calls:
+            remaining = _BARE_INVOKE_RE.sub("", raw_text).strip()
+            # Also strip any wrapper text like "minimax:tool_call"
+            remaining = re.sub(r'\S*:tool_call\s*', '', remaining).strip()
+            return remaining or None, bare_calls
         return raw_text, []
 
     tool_calls = []
