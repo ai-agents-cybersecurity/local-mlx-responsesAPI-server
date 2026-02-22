@@ -380,10 +380,33 @@ def _build_prompt(tokenizer, messages: list[dict], tools: list[dict] | None = No
         except Exception:
             # Some templates don't support tools kwarg — fall back without it
             template_kwargs.pop("tools", None)
-            prompt_text = tokenizer.apply_chat_template(
-                msg_dicts,
-                **template_kwargs,
-            )
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    msg_dicts,
+                    **template_kwargs,
+                )
+            except Exception:
+                # Template can't handle tool messages — flatten them into
+                # plain user/assistant messages so generation can proceed
+                log.warning("Chat template failed with tool messages, flattening")
+                flat = []
+                for d in msg_dicts:
+                    if d["role"] == "tool":
+                        # Convert tool result to a user message
+                        flat.append({"role": "user", "content": f"[Tool result]: {d.get('content', '')}"})
+                    elif d.get("tool_calls"):
+                        # Convert assistant tool call to a plain assistant message
+                        tc_text = ", ".join(
+                            f"{tc.get('function', {}).get('name', '?')}(...)"
+                            for tc in d["tool_calls"]
+                        )
+                        flat.append({"role": "assistant", "content": f"[Called tools: {tc_text}]"})
+                    else:
+                        flat.append({"role": d["role"], "content": d.get("content") or ""})
+                prompt_text = tokenizer.apply_chat_template(
+                    flat,
+                    **template_kwargs,
+                )
     else:
         # Fallback: plain concatenation
         prompt_text = "\n".join(
@@ -775,6 +798,29 @@ def _responses_input_to_messages(
         for item in input_data:
             if isinstance(item, dict):
                 item_type = item.get("type", "")
+
+                # Handle function_call → convert to assistant message with tool_calls
+                if item_type == "function_call":
+                    call_id = item.get("call_id") or item.get("id", _call_id())
+                    fn_name = item.get("name", "")
+                    arguments = item.get("arguments", "{}")
+                    if isinstance(arguments, dict):
+                        arguments = json.dumps(arguments)
+                    # Merge into the previous assistant message if it already has tool_calls
+                    tc_entry = {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": arguments},
+                    }
+                    if new_messages and new_messages[-1].get("role") == "assistant" and "tool_calls" in new_messages[-1]:
+                        new_messages[-1]["tool_calls"].append(tc_entry)
+                    else:
+                        new_messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [tc_entry],
+                        })
+                    continue
 
                 # Handle function_call_output → convert to tool role message
                 if item_type == "function_call_output":
