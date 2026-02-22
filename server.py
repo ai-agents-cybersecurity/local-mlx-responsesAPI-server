@@ -502,7 +502,11 @@ def _parse_xml_tool_call(inner: str) -> dict | None:
 
 
 def _parse_invoke_tool_call(inner: str) -> dict | None:
-    """Parse MiniMax invoke format: <invoke name="NAME"><parameter name="K">V</parameter></invoke>."""
+    """Parse MiniMax invoke format: <invoke name="NAME"><parameter name="K">V</parameter></invoke>.
+
+    Also handles mixed formats where parameters use <parameter=K> (Qwen-style)
+    or where arguments are JSON inside the <invoke> body.
+    """
     invoke_match = _INVOKE_RE.search(inner)
     if not invoke_match:
         return None
@@ -511,6 +515,7 @@ def _parse_invoke_tool_call(inner: str) -> dict | None:
     body = invoke_match.group(2)
 
     params = {}
+    # Try <parameter name="key">value</parameter> first
     for pm in _INVOKE_PARAM_RE.finditer(body):
         key = pm.group(1).strip()
         value = pm.group(2).strip()
@@ -518,6 +523,30 @@ def _parse_invoke_tool_call(inner: str) -> dict | None:
             params[key] = json.loads(value)
         except (json.JSONDecodeError, ValueError):
             params[key] = value
+
+    # Also try <parameter=key>value</parameter> (Qwen-style)
+    if not params:
+        for pm in _TOOL_CALL_PARAM_RE.finditer(body):
+            key = pm.group(1).strip()
+            value = pm.group(2).strip()
+            try:
+                params[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                params[key] = value
+
+    # Fallback: try to parse the body as JSON arguments
+    if not params:
+        json_match = _TOOL_CALL_JSON_RE.search(body)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group())
+                if isinstance(parsed, dict):
+                    params = parsed
+            except json.JSONDecodeError:
+                pass
+
+    if not params:
+        log.warning("Invoke tool call '%s' has no parseable arguments. Body: %s", name, body[:300])
 
     return {"name": name, "arguments": json.dumps(params)}
 
@@ -570,6 +599,7 @@ def _parse_tool_calls(raw_text: str) -> tuple[str | None, list[dict]]:
 
     tool_calls = []
     for inner in blocks:
+        log.info("Tool call block content: %s", repr(inner[:500]))
         # Try JSON, then XML (<function=...>), then invoke (<invoke name=...>)
         result = (
             _parse_json_tool_call(inner)
