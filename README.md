@@ -9,7 +9,7 @@ An OpenAI-compatible local inference server for Apple Silicon using [MLX](https:
 | File | Purpose |
 |---|---|
 | `server.py` | OpenAI-compatible chat server with Chat Completions and Responses APIs |
-| `test_server.py` | Integration test client for the server (health, models, chat, streaming, responses, multi-turn) |
+| `test_server.py` | Integration test client for the server (health, models, chat, streaming, tool calling, responses, multi-turn) |
 
 ## server.py — the main event
 
@@ -23,6 +23,7 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 
 - **OpenAI Chat Completions API** (`/v1/chat/completions`) — streaming and non-streaming
 - **OpenAI Responses API** (`/v1/responses`) — streaming and non-streaming, with multi-turn conversation via `previous_response_id`
+- **Tool/Function Calling** — full round-trip support: model emits structured tool calls, client executes tools, results fed back to model for final response. Works in both streaming and non-streaming modes across both APIs. Supports Qwen3 JSON format (`<tool_call>{"name":...}</tool_call>`) and Qwen3.5 XML format (`<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`)
 - **`/v1/models`** — model discovery endpoint
 - **`/health`** — readiness probe
 - **Multi-turn conversation store** — in-memory with 1-hour TTL, auto-archiving expired conversations to `conversation_logs/` as JSON
@@ -46,19 +47,22 @@ A FastAPI server that loads any MLX model and exposes OpenAI-compatible endpoint
 | `stream` | false | SSE streaming |
 | `stop` | none | String or list of stop sequences |
 | `repetition_penalty` | 1.0 | |
+| `tools` | none | List of tool/function definitions (OpenAI format) |
+| `tool_choice` | none | `"none"` to suppress tool use, `"auto"` or omit for model discretion |
 
 ### Responses API parameters
 
 | Parameter | Default | Notes |
 |---|---|---|
 | `model` | loaded model | Ignored for routing; echoed back in the response |
-| `input` | required | String or message list (supports inline conversation history and multi-part content) |
+| `input` | required | String or message list (supports inline conversation history, multi-part content, and `function_call_output` items for tool results) |
 | `instructions` | none | System prompt |
 | `previous_response_id` | none | Chain multi-turn conversations |
 | `temperature` | 0.7 | 0.0–2.0 |
 | `top_p` | 0.95 | 0.0–1.0 |
 | `max_output_tokens` | 4096 | |
 | `stream` | false | SSE streaming |
+| `tools` | none | List of tool definitions (flat format: `{type, name, description, parameters}`) |
 
 Extra fields sent by OpenAI clients (like `presence_penalty`, `frequency_penalty`, etc.) are silently ignored so nothing breaks.
 

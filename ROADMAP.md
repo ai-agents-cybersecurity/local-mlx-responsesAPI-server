@@ -1,5 +1,13 @@
 # Roadmap
 
+## ~~Tool/Function Calling~~ (Done)
+
+Non-streaming and streaming tool calling across both Chat Completions and Responses APIs. Supports Qwen3 JSON and Qwen3.5 XML tool call formats. Full round-trip: model emits structured tool calls, client executes, results fed back for final response. Tested end-to-end with OpenClaw.
+
+## Streaming Tool Call Optimization
+
+Currently, when tools are provided in streaming mode, the full output is buffered until generation completes so tool call tags can be detected. A future optimization could parse tool call tags incrementally to emit structured chunks sooner.
+
 ## Conversation State Management
 
 Currently using an in-memory dict (`_conversation_store`) — ephemeral, lost on restart.

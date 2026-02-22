@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
 import uuid
@@ -41,6 +42,7 @@ from typing import AsyncIterator
 
 import mlx.core as mx
 from mlx_lm import load, stream_generate, generate
+from mlx_lm.utils import load_model, load_tokenizer, _download
 from mlx_lm.sample_utils import make_sampler
 
 import uvicorn
@@ -64,6 +66,9 @@ log = logging.getLogger("mlx-server")
 class ChatMessage(BaseModel):
     role: str
     content: str | list | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
     model_config = {"extra": "ignore"}
 
     def text(self) -> str:
@@ -84,6 +89,8 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stop: list[str] | str | None = None
     repetition_penalty: float = Field(default=1.0, ge=0.0)
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
     # extra fields silently ignored so any OpenAI client works
     model_config = {"extra": "ignore"}
 
@@ -96,7 +103,8 @@ class UsageInfo(BaseModel):
 
 class ChoiceMessage(BaseModel):
     role: str = "assistant"
-    content: str
+    content: str | None = None
+    tool_calls: list[dict] | None = None
 
 
 class Choice(BaseModel):
@@ -126,6 +134,7 @@ class ResponsesRequest(BaseModel):
     top_p: float = Field(default=0.95, ge=0.0, le=1.0)
     max_output_tokens: int | None = Field(default=4096, ge=1)
     stream: bool = False
+    tools: list[dict] | None = None
     model_config = {"extra": "ignore"}
 
 
@@ -155,7 +164,7 @@ class ResponsesApiResponse(BaseModel):
     created_at: int
     model: str
     status: str = "completed"
-    output: list[ResponsesOutputMessage] = []
+    output: list = []
     usage: ResponsesUsage | None = None
 
 
@@ -171,10 +180,38 @@ class ModelHolder:
     tokenizer: object = None
     loaded: bool = False
 
+    @staticmethod
+    def _resolve_path(model_path: str) -> Path:
+        """Return a local Path, using the HF cache if available to avoid network calls."""
+        p = Path(model_path)
+        if p.exists():
+            return p
+        # Check HF cache before hitting the network
+        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+        repo_dir = cache_dir / ("models--" + model_path.replace("/", "--"))
+        if repo_dir.exists():
+            snapshots = repo_dir / "snapshots"
+            if snapshots.exists():
+                revisions = sorted(snapshots.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
+                for rev in revisions:
+                    # Only use cache if snapshot has weight files, not just metadata
+                    has_weights = any(rev.glob("*.safetensors"))
+                    has_tokenizer = any(rev.glob("tokenizer*"))
+                    if has_weights and has_tokenizer:
+                        log.info("Using cached model at %s", rev)
+                        return rev
+            log.info("Incomplete cache for %s, downloading missing files…", model_path)
+        return Path(_download(model_path))
+
     def load(self, model_path: str) -> None:
         log.info("Loading model %s …", model_path)
         t0 = time.perf_counter()
-        self.model, self.tokenizer = load(model_path)
+        local_path = self._resolve_path(model_path)
+        model, config = load_model(local_path, lazy=False, strict=False)
+        tokenizer = load_tokenizer(
+            local_path, eos_token_ids=config.get("eos_token_id", None)
+        )
+        self.model, self.tokenizer = model, tokenizer
         self.model_path = model_path
         self.loaded = True
         elapsed = time.perf_counter() - t0
@@ -266,16 +303,87 @@ def _get_conversation(resp_id: str) -> tuple[str, list[dict]] | None:
 # ── Prompt helpers ───────────────────────────────────────────────────────────
 
 
-def _build_prompt(tokenizer, messages: list[dict]) -> tuple[str, int]:
+def _normalize_tools_for_template(tools: list[dict]) -> list[dict]:
+    """Normalize tool definitions to the format expected by apply_chat_template(tools=...).
+
+    Accepts both OpenAI Chat format (nested: {type, function: {name, ...}})
+    and Responses API format (flat: {type, name, description, parameters}).
+    Returns list of {type: "function", function: {name, description, parameters}}.
+    """
+    normalized = []
+    for tool in tools:
+        if "function" in tool:
+            # Already in OpenAI Chat format
+            normalized.append({
+                "type": "function",
+                "function": {
+                    "name": tool["function"].get("name", ""),
+                    "description": tool["function"].get("description", ""),
+                    "parameters": tool["function"].get("parameters", {}),
+                },
+            })
+        else:
+            # Responses API flat format: {type, name, description, parameters}
+            normalized.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {}),
+                },
+            })
+    return normalized
+
+
+def _build_prompt(tokenizer, messages: list[dict], tools: list[dict] | None = None) -> tuple[str, int]:
     """Apply the tokenizer's chat template and return (prompt_text, token_count)."""
-    msg_dicts = [{"role": m["role"], "content": m["content"]} for m in messages]
+    # Preserve tool-related fields in message dicts
+    msg_dicts = []
+    for m in messages:
+        d = {"role": m["role"], "content": m.get("content") or ""}
+        if m.get("tool_calls"):
+            # Jinja templates (Qwen3.5 etc.) expect arguments as a dict,
+            # but OpenAI wire format stores them as a JSON string.
+            # Deserialize here so the template can iterate with .items().
+            template_tcs = []
+            for tc in m["tool_calls"]:
+                tc_copy = {**tc}
+                if "function" in tc_copy:
+                    func = {**tc_copy["function"]}
+                    args = func.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            func["arguments"] = {}
+                    tc_copy["function"] = func
+                template_tcs.append(tc_copy)
+            d["tool_calls"] = template_tcs
+        if m.get("tool_call_id"):
+            d["tool_call_id"] = m["tool_call_id"]
+        if m.get("name"):
+            d["name"] = m["name"]
+        msg_dicts.append(d)
 
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        prompt_text = tokenizer.apply_chat_template(
-            msg_dicts,
+        template_kwargs = dict(
             tokenize=False,
             add_generation_prompt=True,
         )
+        if tools:
+            template_kwargs["tools"] = tools
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                msg_dicts,
+                **template_kwargs,
+            )
+        except Exception:
+            # Some templates don't support tools kwarg — fall back without it
+            template_kwargs.pop("tools", None)
+            prompt_text = tokenizer.apply_chat_template(
+                msg_dicts,
+                **template_kwargs,
+            )
     else:
         # Fallback: plain concatenation
         prompt_text = "\n".join(
@@ -290,17 +398,284 @@ def _build_prompt(tokenizer, messages: list[dict]) -> tuple[str, int]:
 # ── Request ID helper ────────────────────────────────────────────────────────
 
 
+def _call_id() -> str:
+    return "call_" + uuid.uuid4().hex[:12]
+
+
 def _req_id() -> str:
     return "chatcmpl-" + uuid.uuid4().hex[:12]
 
 
 _THINK_RE = re.compile(r"(<think>)?[\s\S]*?</think>\s*", re.DOTALL)
 
+# GPT-OSS channel format: extract only <|channel|>final<|message|>...<|end|>
+_CHANNEL_FINAL_RE = re.compile(
+    r"<\|channel\|>final<\|message\|>([\s\S]*?)(?:<\|end\|>|$)"
+)
+
 
 def _strip_think(text: str) -> str:
     """Remove <think>...</think> reasoning blocks from model output.
     Handles cases where the opening <think> tag is missing."""
     return _THINK_RE.sub("", text)
+
+
+def _strip_channels(text: str) -> str:
+    """Extract final-channel content from GPT-OSS channel format.
+    If the text doesn't use channel format, returns it unchanged."""
+    if "<|channel|>" not in text:
+        return text
+    matches = _CHANNEL_FINAL_RE.findall(text)
+    if matches:
+        return "\n".join(m.strip() for m in matches)
+    return text
+
+
+def _postprocess(text: str) -> str:
+    """Apply all model-output cleanup: think-tags, channel format, etc."""
+    text = _strip_think(text)
+    text = _strip_channels(text)
+    return text
+
+
+# Matches the outer <tool_call>...</tool_call> wrapper (any content inside)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.DOTALL)
+
+# JSON-style inner content: {"name": ..., "arguments": ...}
+_TOOL_CALL_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+# XML-style inner content: <function=NAME> <parameter=KEY> VALUE </parameter> ... </function>
+_TOOL_CALL_FUNC_RE = re.compile(r"<function=([^>]+)>([\s\S]*?)</function>", re.DOTALL)
+_TOOL_CALL_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>", re.DOTALL)
+
+
+def _parse_xml_tool_call(inner: str) -> dict | None:
+    """Parse XML-style tool call: <function=NAME><parameter=K>V</parameter>...</function>."""
+    func_match = _TOOL_CALL_FUNC_RE.search(inner)
+    if not func_match:
+        return None
+
+    name = func_match.group(1).strip()
+    body = func_match.group(2)
+
+    params = {}
+    for pm in _TOOL_CALL_PARAM_RE.finditer(body):
+        key = pm.group(1).strip()
+        value = pm.group(2).strip()
+        # Try to parse as JSON value (number, bool, etc.), otherwise keep as string
+        try:
+            params[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            params[key] = value
+
+    return {"name": name, "arguments": json.dumps(params)}
+
+
+def _parse_json_tool_call(inner: str) -> dict | None:
+    """Parse JSON-style tool call: {"name": "...", "arguments": {...}}."""
+    json_match = _TOOL_CALL_JSON_RE.search(inner)
+    if not json_match:
+        return None
+    try:
+        parsed = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None
+
+    name = parsed.get("name", "")
+    arguments = parsed.get("arguments", {})
+    if isinstance(arguments, dict):
+        arguments = json.dumps(arguments)
+    return {"name": name, "arguments": arguments}
+
+
+def _parse_tool_calls(raw_text: str) -> tuple[str | None, list[dict]]:
+    """Extract <tool_call>...</tool_call> blocks from model output.
+
+    Supports two inner formats:
+      - JSON (Qwen3/Hermes): <tool_call>{"name":"fn","arguments":{...}}</tool_call>
+      - XML  (Qwen3.5):      <tool_call><function=fn><parameter=k>v</parameter></function></tool_call>
+
+    Returns (remaining_text_or_None, list_of_tool_call_dicts).
+    Each tool call dict has {id, type, function: {name, arguments}}.
+    """
+    blocks = _TOOL_CALL_BLOCK_RE.findall(raw_text)
+    if not blocks:
+        return raw_text, []
+
+    tool_calls = []
+    for inner in blocks:
+        # Try JSON first, then XML
+        result = _parse_json_tool_call(inner) or _parse_xml_tool_call(inner)
+        if result is None:
+            log.warning("Failed to parse tool_call content: %s", inner[:200])
+            continue
+
+        tool_calls.append({
+            "id": _call_id(),
+            "type": "function",
+            "function": result,
+        })
+
+    if not tool_calls:
+        return raw_text, []
+
+    # Strip tool_call blocks from text; remaining text is the non-tool content
+    remaining = _TOOL_CALL_BLOCK_RE.sub("", raw_text).strip()
+    return remaining or None, tool_calls
+
+
+def _postprocess_with_tools(raw_text: str, tools_were_provided: bool) -> tuple[str | None, list[dict] | None, str]:
+    """Post-process model output with tool call extraction.
+
+    Returns (content, tool_calls, finish_reason).
+    """
+    text = _strip_think(raw_text)
+    text = _strip_channels(text)
+
+    if tools_were_provided:
+        content, tool_calls = _parse_tool_calls(text)
+        if tool_calls:
+            return content, tool_calls, "tool_calls"
+
+    return text, None, "stop"
+
+
+class _StreamFilter:
+    """Streaming filter that buffers tokens until think-tags and channel
+    markers are resolved, then yields only user-facing text."""
+
+    def __init__(self):
+        self._buf = ""
+        self._thinking = True  # assume output may start inside <think>
+        self._in_final = False  # inside <|channel|>final<|message|>...
+        self._uses_channels = False
+
+    def feed(self, token: str) -> str:
+        """Feed a token, return text to emit (may be empty)."""
+        # Phase 1: buffer while inside <think> block
+        if self._thinking:
+            self._buf += token
+            end = self._buf.find("</think>")
+            if end != -1:
+                self._thinking = False
+                after = self._buf[end + len("</think>"):]
+                self._buf = ""
+                if not after.strip():
+                    return ""
+                # Fall through to channel check with accumulated text
+                token = after.lstrip("\n")
+            elif "<|channel|>" in self._buf or "<|start|>" in self._buf:
+                # Not a think-tag model — switch to channel mode
+                self._thinking = False
+                self._uses_channels = True
+                token = self._buf
+                self._buf = ""
+            else:
+                return ""
+
+        # Phase 2: handle <|channel|> format
+        self._buf += token
+
+        # Detect channel format on first occurrence
+        if not self._uses_channels and "<|channel|>" in self._buf:
+            self._uses_channels = True
+
+        if not self._uses_channels:
+            # No channel format — emit directly
+            out = self._buf
+            self._buf = ""
+            return out
+
+        # Buffer until we can resolve channel boundaries
+        emit = ""
+        while True:
+            if self._in_final:
+                # Look for end marker
+                end_pos = self._buf.find("<|end|>")
+                start_pos = self._buf.find("<|start|>")
+                # Find the earliest boundary
+                boundary = -1
+                if end_pos != -1 and start_pos != -1:
+                    boundary = min(end_pos, start_pos)
+                elif end_pos != -1:
+                    boundary = end_pos
+                elif start_pos != -1:
+                    boundary = start_pos
+
+                if boundary != -1:
+                    emit += self._buf[:boundary]
+                    # Skip past the marker
+                    if self._buf[boundary:].startswith("<|end|>"):
+                        self._buf = self._buf[boundary + len("<|end|>"):]
+                    else:
+                        self._buf = self._buf[boundary:]
+                    self._in_final = False
+                else:
+                    # Could be partial marker at end — hold back potential partial
+                    safe, self._buf = self._safe_emit(self._buf)
+                    emit += safe
+                    break
+            else:
+                # Look for <|channel|>final<|message|>
+                marker = "<|channel|>final<|message|>"
+                pos = self._buf.find(marker)
+                if pos != -1:
+                    self._buf = self._buf[pos + len(marker):]
+                    self._in_final = True
+                    continue
+                # Check for other channel starts to skip
+                ch_pos = self._buf.find("<|channel|>")
+                if ch_pos != -1:
+                    # Non-final channel — discard up to next boundary and keep looking
+                    rest = self._buf[ch_pos + len("<|channel|>"):]
+                    end_pos = rest.find("<|end|>")
+                    if end_pos != -1:
+                        self._buf = rest[end_pos + len("<|end|>"):]
+                        continue
+                    start_pos = rest.find("<|start|>")
+                    if start_pos != -1:
+                        self._buf = rest[start_pos:]
+                        continue
+                    # No end found yet — keep buffering
+                    break
+                else:
+                    # No channel markers — might be partial, hold back
+                    safe, self._buf = self._safe_emit(self._buf)
+                    # But don't emit non-channel text when we know format uses channels
+                    break
+
+            if not self._buf:
+                break
+
+        return emit
+
+    def flush(self) -> str:
+        """Flush any remaining buffered text at end of stream."""
+        if not self._buf:
+            return ""
+        if self._uses_channels:
+            # Only emit if we were in the final channel
+            if self._in_final:
+                out = self._buf
+                self._buf = ""
+                return out
+            # Discard leftover non-final content
+            self._buf = ""
+            return ""
+        # No channel format — emit whatever is left (e.g. no think block)
+        out = _strip_think(self._buf)
+        self._buf = ""
+        return out
+
+    @staticmethod
+    def _safe_emit(buf: str) -> tuple[str, str]:
+        """Split buf into safe-to-emit prefix and remainder that could be
+        the start of a special token like <|channel|>, <|end|>, <|start|>."""
+        # Hold back anything from the last '<' onwards (could be partial tag)
+        last_lt = buf.rfind("<")
+        if last_lt != -1 and last_lt > len(buf) - 30:
+            return buf[:last_lt], buf[last_lt:]
+        return buf, ""
 
 
 def _resp_id() -> str:
@@ -352,10 +727,21 @@ def _responses_input_to_messages(
         log.info("Responses input list (%d items): %r", len(input_data), input_data)
         for item in input_data:
             if isinstance(item, dict):
+                item_type = item.get("type", "")
+
+                # Handle function_call_output → convert to tool role message
+                if item_type == "function_call_output":
+                    new_messages.append({
+                        "role": "tool",
+                        "content": item.get("output", ""),
+                        "tool_call_id": item.get("call_id", ""),
+                    })
+                    continue
+
                 role = item.get("role", "user")
                 content = _normalise_content(item.get("content", ""))
                 # Some clients send {"type": "message", ...} wrapper
-                if item.get("type") == "message" and not content and "content" not in item:
+                if item_type == "message" and not content and "content" not in item:
                     # Skip structural items without content
                     continue
                 new_messages.append({"role": role, "content": content})
@@ -432,8 +818,24 @@ async def chat_completions(req: ChatCompletionRequest):
     if not holder.loaded:
         raise HTTPException(503, "Model not loaded yet")
 
-    messages = [{"role": m.role, "content": m.text()} for m in req.messages]
-    prompt_text, prompt_len = _build_prompt(holder.tokenizer, messages)
+    # Convert ChatMessage objects to dicts, preserving tool-related fields
+    messages = []
+    for m in req.messages:
+        d: dict = {"role": m.role, "content": m.text()}
+        if m.tool_calls:
+            d["tool_calls"] = m.tool_calls
+        if m.tool_call_id:
+            d["tool_call_id"] = m.tool_call_id
+        if m.name:
+            d["name"] = m.name
+        messages.append(d)
+
+    # Normalize tools for the chat template
+    template_tools = None
+    if req.tools and req.tool_choice != "none":
+        template_tools = _normalize_tools_for_template(req.tools)
+
+    prompt_text, prompt_len = _build_prompt(holder.tokenizer, messages, tools=template_tools)
 
     max_tokens = req.max_tokens or 4096
     completion_id = _req_id()
@@ -452,63 +854,135 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # ── Streaming ────────────────────────────────────────────────────────
     if req.stream:
+        has_tools = bool(template_tools)
 
         async def event_stream() -> AsyncIterator[str]:
             async with _inference_lock:
                 comp_tokens = 0
-                buf = ""
-                thinking = True  # assume output starts inside <think>
+                filt = _StreamFilter()
+                # When tools are provided, buffer everything so we can
+                # detect tool_call tags before emitting content.
+                raw_buf = "" if has_tools else None
 
                 for resp in stream_generate(**gen_kwargs):
                     comp_tokens += 1
+                    text = filt.feed(resp.text)
+                    if not text:
+                        continue
 
-                    if thinking:
-                        buf += resp.text
-                        # Check if we've exited the think block
-                        end = buf.find("</think>")
-                        if end != -1:
-                            thinking = False
-                            # Grab any text after </think>
-                            after = buf[end + len("</think>"):]
-                            buf = ""
-                            text = after.lstrip("\n")
-                            if not text:
-                                continue
-                        else:
-                            continue
+                    if raw_buf is not None:
+                        # Tools mode: accumulate, don't emit yet
+                        raw_buf += text
                     else:
-                        text = resp.text
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
-                    chunk = {
+                # Flush any remaining buffered text from StreamFilter
+                remaining = filt.flush()
+
+                if raw_buf is not None:
+                    # Tools mode: post-process the full output
+                    raw_buf += (remaining or "")
+                    content, tool_calls_list = _parse_tool_calls(raw_buf)
+
+                    if tool_calls_list:
+                        # Emit tool calls as structured chunks
+                        for i, tc in enumerate(tool_calls_list):
+                            tc_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "tool_calls": [{
+                                                "index": i,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": tc["function"],
+                                            }],
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(tc_chunk)}\n\n"
+
+                        final = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                        }
+                        yield f"data: {json.dumps(final)}\n\n"
+                    else:
+                        # No tool calls found — emit accumulated text as content
+                        if raw_buf:
+                            chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": raw_buf},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+
+                        final = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(final)}\n\n"
+                else:
+                    # No tools mode: emit remaining + final stop
+                    if remaining:
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": remaining},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                    final = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": text},
-                                "finish_reason": None,
-                            }
-                        ],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                # Final chunk with finish_reason
-                final = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(final)}\n\n"
+                    yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -525,8 +999,9 @@ async def chat_completions(req: ChatCompletionRequest):
     async with _inference_lock:
         result = generate(**gen_kwargs)
 
-    result = _strip_think(result)
-    comp_len = len(holder.tokenizer.encode(result))
+    content, tool_calls, finish_reason = _postprocess_with_tools(result, tools_were_provided=bool(template_tools))
+    result_text = content or ""
+    comp_len = len(holder.tokenizer.encode(result_text)) if result_text else 0
 
     return ChatCompletionResponse(
         id=completion_id,
@@ -534,8 +1009,8 @@ async def chat_completions(req: ChatCompletionRequest):
         model=model_name,
         choices=[
             Choice(
-                message=ChoiceMessage(content=result),
-                finish_reason="stop",
+                message=ChoiceMessage(content=content, tool_calls=tool_calls),
+                finish_reason=finish_reason,
             )
         ],
         usage=UsageInfo(
@@ -557,7 +1032,13 @@ async def responses_create(req: ResponsesRequest):
         raise HTTPException(503, "Model not loaded yet")
 
     session_id, messages = _responses_input_to_messages(req.input, req.instructions, req.previous_response_id)
-    prompt_text, prompt_len = _build_prompt(holder.tokenizer, messages)
+
+    # Normalize tools for the chat template
+    template_tools = None
+    if req.tools:
+        template_tools = _normalize_tools_for_template(req.tools)
+
+    prompt_text, prompt_len = _build_prompt(holder.tokenizer, messages, tools=template_tools)
 
     max_tokens = req.max_output_tokens or 4096
     resp_id = _resp_id()
@@ -577,6 +1058,7 @@ async def responses_create(req: ResponsesRequest):
 
     # ── Streaming ────────────────────────────────────────────────────────
     if req.stream:
+        has_tools = bool(template_tools)
 
         async def _stream_response() -> AsyncIterator[str]:
             def _evt(event_type: str, data: dict) -> str:
@@ -596,102 +1078,154 @@ async def responses_create(req: ResponsesRequest):
             yield _evt("response.created", stub_response)
             yield _evt("response.in_progress", stub_response)
 
-            # output_item.added
-            msg_item = {
-                "type": "message",
-                "id": msg_id,
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            }
-            yield _evt(
-                "response.output_item.added",
-                {"output_index": 0, "item": msg_item},
-            )
-
-            # content_part.added
-            content_part = {"type": "output_text", "text": "", "annotations": []}
-            yield _evt(
-                "response.content_part.added",
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": content_part,
-                },
-            )
-
-            # Generate tokens
+            # Generate tokens (buffer when tools are present)
             full_text = ""
             comp_tokens = 0
-            buf = ""
-            thinking = True
+            filt = _StreamFilter()
+            # When tools provided, defer all output items until generation completes
+            items_emitted = False
+
+            if not has_tools:
+                # No tools: emit message item + content part immediately for streaming
+                msg_item = {
+                    "type": "message",
+                    "id": msg_id,
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }
+                yield _evt(
+                    "response.output_item.added",
+                    {"output_index": 0, "item": msg_item},
+                )
+                content_part = {"type": "output_text", "text": "", "annotations": []}
+                yield _evt(
+                    "response.content_part.added",
+                    {"output_index": 0, "content_index": 0, "part": content_part},
+                )
+                items_emitted = True
 
             async with _inference_lock:
                 for resp in stream_generate(**gen_kwargs):
                     comp_tokens += 1
-
-                    if thinking:
-                        buf += resp.text
-                        end = buf.find("</think>")
-                        if end != -1:
-                            thinking = False
-                            after = buf[end + len("</think>") :]
-                            buf = ""
-                            text = after.lstrip("\n")
-                            if not text:
-                                continue
-                        else:
-                            continue
-                    else:
-                        text = resp.text
+                    text = filt.feed(resp.text)
+                    if not text:
+                        continue
 
                     full_text += text
+                    if not has_tools:
+                        yield _evt(
+                            "response.output_text.delta",
+                            {"output_index": 0, "content_index": 0, "delta": text},
+                        )
+
+            # Flush any remaining buffered text from StreamFilter
+            remaining = filt.flush()
+            if remaining:
+                full_text += remaining
+                if not has_tools:
                     yield _evt(
                         "response.output_text.delta",
-                        {
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": text,
-                        },
+                        {"output_index": 0, "content_index": 0, "delta": remaining},
                     )
 
-            # Store conversation for multi-turn
-            _store_conversation(resp_id, session_id, messages + [{"role": "assistant", "content": full_text}])
+            # Post-process for tool calls when tools were provided
+            output_items_done = []
+            if has_tools:
+                text_content, tool_calls_list = _parse_tool_calls(full_text)
+                if tool_calls_list:
+                    # Emit function_call output items
+                    for i, tc in enumerate(tool_calls_list):
+                        fc_item = {
+                            "type": "function_call",
+                            "id": tc["id"],
+                            "call_id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                            "status": "completed",
+                        }
+                        yield _evt(
+                            "response.output_item.added",
+                            {"output_index": i, "item": fc_item},
+                        )
+                        yield _evt(
+                            "response.output_item.done",
+                            {"output_index": i, "item": fc_item},
+                        )
+                        output_items_done.append(fc_item)
 
-            # output_text.done
-            yield _evt(
-                "response.output_text.done",
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": full_text,
-                },
-            )
+                    # Store with tool calls for multi-turn
+                    assistant_msg: dict = {"role": "assistant", "content": text_content}
+                    assistant_msg["tool_calls"] = tool_calls_list
+                    _store_conversation(resp_id, session_id, messages + [assistant_msg])
+                else:
+                    # No tool calls found — emit as normal message
+                    msg_item = {
+                        "type": "message",
+                        "id": msg_id,
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    }
+                    yield _evt(
+                        "response.output_item.added",
+                        {"output_index": 0, "item": msg_item},
+                    )
+                    content_part = {"type": "output_text", "text": "", "annotations": []}
+                    yield _evt(
+                        "response.content_part.added",
+                        {"output_index": 0, "content_index": 0, "part": content_part},
+                    )
+                    if full_text:
+                        yield _evt(
+                            "response.output_text.delta",
+                            {"output_index": 0, "content_index": 0, "delta": full_text},
+                        )
+                    yield _evt(
+                        "response.output_text.done",
+                        {"output_index": 0, "content_index": 0, "text": full_text},
+                    )
+                    yield _evt(
+                        "response.content_part.done",
+                        {"output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}},
+                    )
+                    msg_item_done = {
+                        "type": "message",
+                        "id": msg_id,
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                    }
+                    yield _evt(
+                        "response.output_item.done",
+                        {"output_index": 0, "item": msg_item_done},
+                    )
+                    output_items_done.append(msg_item_done)
+                    _store_conversation(resp_id, session_id, messages + [{"role": "assistant", "content": full_text}])
+            else:
+                # No tools path — finalize the already-streaming message
+                _store_conversation(resp_id, session_id, messages + [{"role": "assistant", "content": full_text}])
 
-            # content_part.done
-            yield _evt(
-                "response.content_part.done",
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": full_text, "annotations": []},
-                },
-            )
-
-            # output_item.done
-            msg_item_done = {
-                "type": "message",
-                "id": msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": full_text, "annotations": []}
-                ],
-            }
-            yield _evt(
-                "response.output_item.done",
-                {"output_index": 0, "item": msg_item_done},
-            )
+                yield _evt(
+                    "response.output_text.done",
+                    {"output_index": 0, "content_index": 0, "text": full_text},
+                )
+                yield _evt(
+                    "response.content_part.done",
+                    {"output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}},
+                )
+                msg_item_done = {
+                    "type": "message",
+                    "id": msg_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                }
+                yield _evt(
+                    "response.output_item.done",
+                    {"output_index": 0, "item": msg_item_done},
+                )
+                output_items_done.append(msg_item_done)
 
             # response.completed
             usage = {
@@ -705,7 +1239,7 @@ async def responses_create(req: ResponsesRequest):
                 "created_at": created,
                 "model": model_name,
                 "status": "completed",
-                "output": [msg_item_done],
+                "output": output_items_done,
                 "usage": usage,
             }
             yield _evt("response.completed", final_response)
@@ -724,22 +1258,41 @@ async def responses_create(req: ResponsesRequest):
     async with _inference_lock:
         result = generate(**gen_kwargs)
 
-    result = _strip_think(result)
-    comp_len = len(holder.tokenizer.encode(result))
+    content, tool_calls, finish_reason = _postprocess_with_tools(result, tools_were_provided=bool(template_tools))
+    result_text = content or ""
+    comp_len = len(holder.tokenizer.encode(result_text)) if result_text else 0
 
-    # Store conversation for multi-turn
-    _store_conversation(resp_id, session_id, messages + [{"role": "assistant", "content": result}])
+    # Build output items
+    output_items: list = []
+    if tool_calls:
+        # Add function_call output items for each tool call
+        for tc in tool_calls:
+            output_items.append({
+                "type": "function_call",
+                "id": tc["id"],
+                "call_id": tc["id"],
+                "name": tc["function"]["name"],
+                "arguments": tc["function"]["arguments"],
+                "status": "completed",
+            })
+        # Store tool calls in conversation for multi-turn
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        assistant_msg["tool_calls"] = tool_calls
+        _store_conversation(resp_id, session_id, messages + [assistant_msg])
+    else:
+        output_items.append(
+            ResponsesOutputMessage(
+                id=msg_id,
+                content=[ResponsesOutputText(text=result_text)],
+            )
+        )
+        _store_conversation(resp_id, session_id, messages + [{"role": "assistant", "content": result_text}])
 
     return ResponsesApiResponse(
         id=resp_id,
         created_at=created,
         model=model_name,
-        output=[
-            ResponsesOutputMessage(
-                id=msg_id,
-                content=[ResponsesOutputText(text=result)],
-            )
-        ],
+        output=output_items,
         usage=ResponsesUsage(
             input_tokens=prompt_len,
             output_tokens=comp_len,
