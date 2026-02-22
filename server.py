@@ -441,12 +441,19 @@ def _postprocess(text: str) -> str:
 # Matches the outer <tool_call>...</tool_call> wrapper (any content inside)
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.DOTALL)
 
+# MiniMax format: <PREFIX:tool_call>...<invoke>...</invoke>...</PREFIX:tool_call>
+_MINIMAX_BLOCK_RE = re.compile(r"<[^>]*:tool_call>\s*([\s\S]*?)\s*</[^>]*:tool_call>", re.DOTALL)
+
 # JSON-style inner content: {"name": ..., "arguments": ...}
 _TOOL_CALL_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # XML-style inner content: <function=NAME> <parameter=KEY> VALUE </parameter> ... </function>
 _TOOL_CALL_FUNC_RE = re.compile(r"<function=([^>]+)>([\s\S]*?)</function>", re.DOTALL)
 _TOOL_CALL_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*([\s\S]*?)\s*</parameter>", re.DOTALL)
+
+# MiniMax invoke format: <invoke name="NAME"><parameter name="KEY">VALUE</parameter></invoke>
+_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)">([\s\S]*?)</invoke>', re.DOTALL)
+_INVOKE_PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)">\s*([\s\S]*?)\s*</parameter>', re.DOTALL)
 
 
 def _parse_xml_tool_call(inner: str) -> dict | None:
@@ -463,6 +470,27 @@ def _parse_xml_tool_call(inner: str) -> dict | None:
         key = pm.group(1).strip()
         value = pm.group(2).strip()
         # Try to parse as JSON value (number, bool, etc.), otherwise keep as string
+        try:
+            params[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            params[key] = value
+
+    return {"name": name, "arguments": json.dumps(params)}
+
+
+def _parse_invoke_tool_call(inner: str) -> dict | None:
+    """Parse MiniMax invoke format: <invoke name="NAME"><parameter name="K">V</parameter></invoke>."""
+    invoke_match = _INVOKE_RE.search(inner)
+    if not invoke_match:
+        return None
+
+    name = invoke_match.group(1).strip()
+    body = invoke_match.group(2)
+
+    params = {}
+    for pm in _INVOKE_PARAM_RE.finditer(body):
+        key = pm.group(1).strip()
+        value = pm.group(2).strip()
         try:
             params[key] = json.loads(value)
         except (json.JSONDecodeError, ValueError):
@@ -494,23 +522,37 @@ def _parse_json_tool_call(inner: str) -> dict | None:
 
 
 def _parse_tool_calls(raw_text: str) -> tuple[str | None, list[dict]]:
-    """Extract <tool_call>...</tool_call> blocks from model output.
+    """Extract tool call blocks from model output.
 
-    Supports two inner formats:
-      - JSON (Qwen3/Hermes): <tool_call>{"name":"fn","arguments":{...}}</tool_call>
-      - XML  (Qwen3.5):      <tool_call><function=fn><parameter=k>v</parameter></function></tool_call>
+    Supported outer wrappers:
+      - <tool_call>...</tool_call>          (Qwen3, Qwen3.5, Hermes)
+      - <PREFIX:tool_call>...</PREFIX:tool_call>  (MiniMax)
+
+    Supported inner formats:
+      - JSON:   {"name":"fn","arguments":{...}}
+      - XML:    <function=fn><parameter=k>v</parameter></function>
+      - Invoke: <invoke name="fn"><parameter name="k">v</parameter></invoke>
 
     Returns (remaining_text_or_None, list_of_tool_call_dicts).
     Each tool call dict has {id, type, function: {name, arguments}}.
     """
+    # Try standard <tool_call> blocks first, then MiniMax format
     blocks = _TOOL_CALL_BLOCK_RE.findall(raw_text)
+    strip_re = _TOOL_CALL_BLOCK_RE
+    if not blocks:
+        blocks = _MINIMAX_BLOCK_RE.findall(raw_text)
+        strip_re = _MINIMAX_BLOCK_RE
     if not blocks:
         return raw_text, []
 
     tool_calls = []
     for inner in blocks:
-        # Try JSON first, then XML
-        result = _parse_json_tool_call(inner) or _parse_xml_tool_call(inner)
+        # Try JSON, then XML (<function=...>), then invoke (<invoke name=...>)
+        result = (
+            _parse_json_tool_call(inner)
+            or _parse_xml_tool_call(inner)
+            or _parse_invoke_tool_call(inner)
+        )
         if result is None:
             log.warning("Failed to parse tool_call content: %s", inner[:200])
             continue
@@ -525,7 +567,7 @@ def _parse_tool_calls(raw_text: str) -> tuple[str | None, list[dict]]:
         return raw_text, []
 
     # Strip tool_call blocks from text; remaining text is the non-tool content
-    remaining = _TOOL_CALL_BLOCK_RE.sub("", raw_text).strip()
+    remaining = strip_re.sub("", raw_text).strip()
     return remaining or None, tool_calls
 
 
