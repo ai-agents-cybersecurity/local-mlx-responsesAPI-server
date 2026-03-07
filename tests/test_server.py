@@ -361,6 +361,238 @@ def test_responses_multi_turn(client: OpenAI) -> bool:
         return False
 
 
+# ── Anthropic Messages API tests ─────────────────────────────────────────────
+
+
+def test_anthropic_messages(base_url: str) -> bool:
+    """Non-streaming Anthropic Messages API."""
+    import urllib.request, json
+
+    url = f"{base_url}messages"
+    payload = json.dumps({
+        "model": "local",
+        "max_tokens": 64,
+        "system": "Reply in one short sentence.",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "temperature": 0.3,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": "local",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+        elapsed = time.perf_counter() - t0
+
+        msg_type = data.get("type")
+        role = data.get("role")
+        content = data.get("content", [])
+        text = content[0].get("text", "") if content else ""
+        usage = data.get("usage", {})
+        print(f"  Response ({elapsed:.1f}s): type={msg_type}, role={role}")
+        print(f"  Text: {text!r}")
+        print(f"  Usage: input={usage.get('input_tokens')} output={usage.get('output_tokens')}")
+
+        if "<think>" in text or "</think>" in text:
+            print("  WARN: think tags found in output!")
+            return False
+        return msg_type == "message" and role == "assistant" and bool(text)
+    except Exception as e:
+        print(f"  Anthropic Messages FAILED: {e}")
+        return False
+
+
+def test_anthropic_messages_stream(base_url: str) -> bool:
+    """Streaming Anthropic Messages API."""
+    import urllib.request, json
+
+    url = f"{base_url}messages"
+    payload = json.dumps({
+        "model": "local",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+        "temperature": 0.3,
+        "stream": True,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": "local",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = r.read().decode()
+        elapsed = time.perf_counter() - t0
+
+        # Parse SSE events
+        deltas = []
+        saw_message_start = False
+        saw_message_stop = False
+        for line in body.splitlines():
+            if line.startswith("data: "):
+                try:
+                    evt = json.loads(line[6:])
+                    evt_type = evt.get("type", "")
+                    if evt_type == "message_start":
+                        saw_message_start = True
+                    elif evt_type == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            deltas.append(delta.get("text", ""))
+                    elif evt_type == "message_stop":
+                        saw_message_stop = True
+                except json.JSONDecodeError:
+                    pass
+
+        full_text = "".join(deltas)
+        print(f"  Stream done ({elapsed:.1f}s, {len(deltas)} deltas): {full_text[:80]!r}")
+        print(f"  message_start={saw_message_start}, message_stop={saw_message_stop}")
+        return saw_message_start and saw_message_stop and len(deltas) > 0
+    except Exception as e:
+        print(f"  Anthropic Messages streaming FAILED: {e}")
+        return False
+
+
+# ── Azure OpenAI endpoint tests ──────────────────────────────────────────────
+
+
+def test_azure_responses(base_url: str) -> bool:
+    """Azure-style Responses API via deployment URL."""
+    import urllib.request, json
+
+    # Derive server root from base_url (strip /v1)
+    server_root = base_url.replace("/v1", "")
+    deployment = "my-gpt4-deployment"
+    url = f"{server_root}/openai/deployments/{deployment}/responses?api-version=2025-03-01-preview"
+
+    payload = json.dumps({
+        "input": "What is 2+2? Reply in one short sentence.",
+        "max_output_tokens": 64,
+        "temperature": 0.3,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "api-key": "local",
+        },
+    )
+    try:
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+        elapsed = time.perf_counter() - t0
+
+        model = data.get("model", "")
+        print(f"  Response ({elapsed:.1f}s), model={model!r}")
+
+        # Verify the deployment name appears as the model in the response
+        if model != deployment:
+            print(f"  WARN: expected model={deployment!r}, got {model!r}")
+
+        # Extract text from output
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    text = c.get("text", "")
+                    if text:
+                        print(f"  Text: {text!r}")
+                        return True
+
+        print("  WARN: No text output found")
+        return False
+    except Exception as e:
+        print(f"  Azure Responses FAILED: {e}")
+        return False
+
+
+def test_azure_responses_stream(base_url: str) -> bool:
+    """Azure-style streaming Responses API."""
+    import urllib.request, json
+
+    server_root = base_url.replace("/v1", "")
+    deployment = "my-gpt4-deployment"
+    url = f"{server_root}/openai/deployments/{deployment}/responses?api-version=2025-03-01-preview"
+
+    payload = json.dumps({
+        "input": "Count from 1 to 3.",
+        "stream": True,
+        "max_output_tokens": 128,
+        "temperature": 0.3,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "api-key": "local",
+        },
+    )
+    try:
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = r.read().decode()
+        elapsed = time.perf_counter() - t0
+
+        # Parse SSE events
+        deltas = []
+        for line in body.splitlines():
+            if line.startswith("data: "):
+                try:
+                    evt = json.loads(line[6:])
+                    if evt.get("type") == "response.output_text.delta":
+                        deltas.append(evt.get("delta", ""))
+                except json.JSONDecodeError:
+                    pass
+
+        full_text = "".join(deltas)
+        print(f"  Stream done ({elapsed:.1f}s, {len(deltas)} deltas): {full_text[:80]!r}")
+        return len(deltas) > 0
+    except Exception as e:
+        print(f"  Azure Responses streaming FAILED: {e}")
+        return False
+
+
+def test_azure_models(base_url: str) -> bool:
+    """Azure-style model listing via deployment URL."""
+    import urllib.request, json
+
+    server_root = base_url.replace("/v1", "")
+    deployment = "my-gpt4-deployment"
+    url = f"{server_root}/openai/deployments/{deployment}/models?api-version=2025-03-01-preview"
+
+    req = urllib.request.Request(
+        url,
+        headers={"api-key": "local"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        models = [m["id"] for m in data.get("data", [])]
+        print(f"  Azure /models → {models}")
+        return deployment in models
+    except Exception as e:
+        print(f"  Azure models FAILED: {e}")
+        return False
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://localhost:8080/v1")
@@ -379,6 +611,11 @@ def main():
         ("Responses streaming", lambda: test_responses_stream(client)),
         ("Responses tool calls", lambda: test_responses_tool_calls(client)),
         ("Responses multi-turn", lambda: test_responses_multi_turn(client)),
+        ("Anthropic Messages API", lambda: test_anthropic_messages(args.base_url)),
+        ("Anthropic Messages streaming", lambda: test_anthropic_messages_stream(args.base_url)),
+        ("Azure Responses API", lambda: test_azure_responses(args.base_url)),
+        ("Azure Responses streaming", lambda: test_azure_responses_stream(args.base_url)),
+        ("Azure models", lambda: test_azure_models(args.base_url)),
     ]
 
     results = []
