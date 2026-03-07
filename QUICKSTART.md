@@ -14,6 +14,7 @@ This installs MLX, mlx-lm, FastAPI, Uvicorn, and Pydantic.
 
 ```bash
 python server.py --model mlx-community/MiniMax-M2.5-8bit --port 8080
+python server.py --model mlx-community/Qwen3.5-9B-bf16
 ```
 
 The first run downloads the model weights from HuggingFace (~8 GB for MiniMax 8-bit). Subsequent runs load from cache.

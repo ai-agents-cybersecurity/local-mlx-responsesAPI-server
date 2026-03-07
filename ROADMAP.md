@@ -21,21 +21,10 @@ Currently using an in-memory dict (`_conversation_store`) — ephemeral, lost on
 | **Redis** | Configurable | Medium | Multi-worker, TTL built-in |
 | **Postgres/DB** | Full durability | Higher | Production |
 
-## Anthropic Messages API (`/v1/messages`)
+## ~~Anthropic Messages API (`/v1/messages`)~~ (Done)
 
-Add a `/v1/messages` endpoint that speaks the Anthropic/Claude native protocol, so clients using the Anthropic SDK can hit this server directly without translation.
+Streaming and non-streaming Messages API compatible with the Anthropic Python SDK. System prompt as top-level `system` field, `user`/`assistant` message array, structured content blocks, and Anthropic SSE event types (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`).
 
-**Key differences from OpenAI Chat Completions:**
-- System prompt is a top-level `system` field, not a message in the array
-- `messages` array only contains `user` and `assistant` roles
-- Content blocks are structured (`type: "text"`, `type: "image"`, etc.) rather than plain strings
-- Streaming uses SSE with typed events (`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`)
-- Response includes `stop_reason` instead of `finish_reason`
-- Token usage split across `message_start` (input) and `message_delta` (output)
-
-**Endpoint:** `POST /v1/messages`
-
-**Client usage would look like:**
 ```python
 from anthropic import Anthropic
 
